@@ -1,0 +1,45 @@
+name: XServerGAMEs Auto Renew
+
+on:
+  schedule:
+    # 每两天（UTC 00:00）执行一次。注意：按日历每两天，不是严格 48 小时。
+    - cron: "0 0 */2 * *"
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Run auto renew
+        env:
+          XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
+          XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
+          XSERVER_COOKIE: ${{ secrets.XSERVER_COOKIE }}
+          TARGET_GAME: ${{ secrets.TARGET_GAME }} # 可选
+          HEADLESS: "1"
+          PLAYWRIGHT_TIMEOUT_MS: "15000"
+        run: |
+          python xserver_autorenew.py
+
+      - name: Upload screenshots (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots
+          if-no-files-found: ignore
