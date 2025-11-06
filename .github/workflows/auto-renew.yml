@@ -2,17 +2,34 @@ name: XServerGAMEs Auto Renew
 
 on:
   schedule:
-    - cron: "0 0 */2 * *"
-  workflow_dispatch:
+    - cron: "0 */12 * * *"     # 每12小时触发一次，由脚本内限流控制每≥60小时才真正续期
+  workflow_dispatch:            # 手动触发，允许手动续期
+    inputs:
+      force:
+        description: "Force run (1 to ignore 60h gate)"
+        required: false
+        default: "0"
+      renew_hours:
+        description: "Renew hours to select on page (e.g., 72, 60)"
+        required: false
+        default: "72"
+      target_game:
+        description: "Target game keyword (optional)"
+        required: false
+        default: ""
+      timezone:
+        description: "Log timezone for .md (e.g., Asia/Tokyo, Asia/Shanghai)"
+        required: false
+        default: "Asia/Tokyo"
 
 permissions:
-  contents: write   # 允许提交变更
+  contents: write   # 允许提交 renew_result.md
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     env:
-      RENEW_LOG_MD: renew_result.md  # 日志文件名，可改
+      RENEW_LOG_MD: renew_result.md
 
     steps:
       - name: Checkout
@@ -31,18 +48,27 @@ jobs:
 
       - name: Run auto renew
         env:
+          # 登录信息（至少提供 Cookie，或提供邮箱+密码作为兜底）
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_COOKIE: ${{ secrets.XSERVER_COOKIE }}
-          TARGET_GAME: ${{ secrets.TARGET_GAME }}
+
+          # 业务参数
+          TARGET_GAME: ${{ github.event.inputs.target_game || secrets.TARGET_GAME }}
+          RENEW_HOURS: ${{ github.event.inputs.renew_hours || '72' }}   # 页面选择的续期时长
+          RENEW_INTERVAL_HOURS: "60"                                    # 续期间隔（脚本限流）
+          FORCE_RENEW: ${{ github.event.inputs.force || '0' }}          # 1=无视60h限流，手动立即续期
+          LOG_TIMEZONE: ${{ github.event.inputs.timezone || 'Asia/Tokyo' }}
+          RENEW_LOG_MD: ${{ env.RENEW_LOG_MD }}
+
+          # 运行参数
           HEADLESS: "1"
           PLAYWRIGHT_TIMEOUT_MS: "15000"
-          RENEW_LOG_MD: ${{ env.RENEW_LOG_MD }}
         run: |
           python xserver_autorenew.py
 
       - name: Commit renewal log (if updated)
-        if: always()     # 即使前一步失败也检查是否有成功日志
+        if: always()
         run: |
           FILE="${{ env.RENEW_LOG_MD }}"
           if [ -f "$FILE" ]; then
@@ -57,3 +83,11 @@ jobs:
             fi
           else
             echo "No log file to commit."
+
+      - name: Upload screenshots (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots
+          if-no-files-found: ignore
