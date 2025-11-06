@@ -7,7 +7,23 @@ import json
 from pathlib import Path
 from typing import List
 
+
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
+
+def write_success_md(filepath="renew_result.md", tzname="Asia/Tokyo"):
+    tz = ZoneInfo(tzname) if ZoneInfo else None
+    now = datetime.now(tz) if tz else datetime.utcnow()
+    suffix = "JST" if tz else "UTC"
+    line = f"{now.strftime('%Y-%m-%d %H:%M:%S')} {suffix} 成功\n"
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(f"[write_success_md] {line.strip()} -> {filepath}")
 
 LOGIN_URL = "https://secure.xserver.ne.jp/xapanel/login/xserver/?request_page=xmgame%2Findex"
 GAME_INDEX_URL = "https://secure.xserver.ne.jp/xapanel/xmgame/index"
