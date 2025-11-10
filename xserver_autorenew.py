@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -24,8 +24,12 @@ PASSWORD = os.getenv("XSERVER_PASSWORD", "").strip()
 COOKIE_STR = os.getenv("XSERVER_COOKIE", "").strip()
 TARGET_GAME = os.getenv("TARGET_GAME", "").strip()
 
-# 续期“选择的时长”（与运行频率无关）
+# 续期“选择的时长”，不是运行间隔（默认 72h，可被 RENEW_HOURS 覆盖）
 RENEW_HOURS = int(os.getenv("RENEW_HOURS", "72"))
+
+# 续期间隔限流（默认 60h，不到期就跳过；FORCE_RENEW=1 可强制执行）
+RENEW_INTERVAL_HOURS = int(os.getenv("RENEW_INTERVAL_HOURS", "60"))
+FORCE_RENEW = os.getenv("FORCE_RENEW", "0") == "1"
 
 # 写入日志 .md 的文件名与时区
 RENEW_LOG_MD = os.getenv("RENEW_LOG_MD", "renew_result.md")
@@ -52,26 +56,19 @@ def snap(page, name: str):
     except Exception as e:
         log(f"Screenshot failed: {e}")
 
-def dump_html(page, name: str):
-    try:
-        out = Path("pages")
-        ensure_dir(out)
-        safe = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", name)
-        p = out / f"{int(time.time())}_{safe}.html"
-        p.write_text(page.content(), encoding="utf-8")
-        log(f"Saved page html: {p}")
-    except Exception as e:
-        log(f"Dump html failed: {e}")
-
 def parse_cookie_string(cookie_str: str, domain: str) -> List[dict]:
     cookies = []
     for item in [p.strip() for p in cookie_str.split(";") if p.strip()]:
         if "=" not in item:
             continue
         name, value = item.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or not value:
+            continue
         cookies.append({
-            "name": name.strip(),
-            "value": value.strip(),
+            "name": name,
+            "value": value,
             "domain": domain,
             "path": "/",
             "httpOnly": False,
@@ -81,7 +78,8 @@ def parse_cookie_string(cookie_str: str, domain: str) -> List[dict]:
     return cookies
 
 def is_logged_in(page) -> bool:
-    for t in ["ログアウト", "マイページ", "アカウント", "お知らせ"]:
+    candidates = ["ログアウト", "サービス管理", "マイページ", "アカウント", "お知らせ"]
+    for t in candidates:
         try:
             if page.get_by_text(t, exact=False).first.is_visible():
                 return True
@@ -89,10 +87,10 @@ def is_logged_in(page) -> bool:
             pass
     return False
 
-def try_click(page_or_frame, locator, timeout=SHORT_TIMEOUT) -> bool:
+def try_click(page, locator, timeout=SHORT_TIMEOUT) -> bool:
     try:
         locator.first.click(timeout=timeout)
-        page_or_frame.wait_for_timeout(250)
+        page.wait_for_timeout(250)
         return True
     except Exception:
         return False
@@ -118,34 +116,6 @@ def click_by_text(page, texts: List[str], roles=("button", "link"), timeout=SHOR
                 pass
     return False
 
-def click_text_global(page, texts):
-    if click_by_text(page, texts):
-        return True
-    for fr in page.frames:
-        if fr == page.main_frame:
-            continue
-        try:
-            for t in texts:
-                try:
-                    if try_click(fr, fr.get_by_role("button", name=t, exact=False)):
-                        return True
-                except Exception:
-                    pass
-                try:
-                    if try_click(fr, fr.get_by_text(t, exact=False)):
-                        return True
-                except Exception:
-                    pass
-                for sel in [f'a:has-text("{t}")', f'button:has-text("{t}")', f'input[value*="{t}"]', f'label:has-text("{t}")']:
-                    try:
-                        if try_click(fr, fr.locator(sel)):
-                            return True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-    return False
-
 def goto(page, url: str):
     page.goto(url, wait_until="domcontentloaded")
     try:
@@ -154,53 +124,50 @@ def goto(page, url: str):
         pass
     page.wait_for_timeout(500)
 
-def scroll_to_bottom(page):
-    try:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    except Exception:
-        pass
-    page.wait_for_timeout(400)
-
-def accept_required_checks(page):
-    # 勾选“同意/確認/承諾”等复选框，避免提交按钮被禁用
-    keywords = ["同意", "確認", "承諾", "同意します", "確認しました", "規約", "注意事項"]
-    for k in keywords:
+# ------------------ Interval Gate (60h default) ------------------
+def _parse_ts_from_line(line: str):
+    m = re.search(r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})\s*(JST|UTC|Z)?', line)
+    if not m:
+        return None
+    ts, tzlabel = m.group(1), (m.group(2) or "JST")
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
         try:
-            page.locator(f'label:has-text("{k}")').first.click(timeout=800)
+            dt = datetime.strptime(ts, fmt)
+            break
         except Exception:
-            pass
-    try:
-        boxes = page.locator('input[type="checkbox"]')
-        count = min(boxes.count(), 5)
-        clicked = 0
-        for i in range(count):
-            el = boxes.nth(i)
-            try:
-                if el.is_visible() and not el.is_checked():
-                    el.check(timeout=800)
-                    clicked += 1
-            except Exception:
-                pass
-        if clicked:
-            log(f"Checked {clicked} agreement checkbox(es).")
-    except Exception:
-        pass
+            dt = None
+    if dt is None:
+        return None
+    if tzlabel in ("UTC", "Z"):
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        jst = ZoneInfo("Asia/Tokyo") if ZoneInfo else timezone(timedelta(hours=9))
+        dt = dt.replace(tzinfo=jst)
+    return dt.astimezone(timezone.utc)
 
-def click_submit_fallback(page):
-    selectors = [
-        'button[type="submit"]:not([disabled])',
-        'input[type="submit"]:not([disabled])',
-        'button:not([disabled]).is-primary, button:not([disabled]).btn-primary, button:not([disabled]).c-btn--primary',
-        'a.button--primary, a.btn-primary'
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                return try_click(page, loc.first, timeout=1500)
-        except Exception:
-            pass
-    return False
+def get_last_success_utc(filepath=RENEW_LOG_MD):
+    p = Path(filepath)
+    if not p.exists():
+        return None
+    try:
+        lines = p.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    for line in reversed(lines):
+        if "成功" in line:
+            dt = _parse_ts_from_line(line)
+            if dt:
+                return dt
+    return None
+
+def should_run_interval(filepath=RENEW_LOG_MD, interval_hours=RENEW_INTERVAL_HOURS):
+    last = get_last_success_utc(filepath)
+    if last is None:
+        return True, None
+    now = datetime.now(timezone.utc)
+    due = last + timedelta(hours=interval_hours)
+    return now >= due, due
 
 # ------------------ Logging to .md ------------------
 def write_success_md(filepath=RENEW_LOG_MD, tzname=LOG_TIMEZONE):
@@ -232,14 +199,12 @@ def cookie_login(context, page) -> bool:
         log(f"Add cookies failed: {e}")
         return False
 
-    # 尝试直接进入 game index
     goto(page, GAME_INDEX_URL)
     snap(page, "after_cookie_goto_game_index")
     if is_logged_in(page):
         log("Logged in via cookie (game index).")
         return True
 
-    # 再试登录页
     goto(page, LOGIN_URL)
     snap(page, "after_cookie_goto_login")
     if is_logged_in(page):
@@ -254,7 +219,7 @@ def password_login(page) -> bool:
     goto(page, LOGIN_URL)
     snap(page, "login_form_loaded")
 
-    # 填邮箱/ID
+    # Fill email/ID
     filled_email = False
     for label in ["メールアドレス", "ログインID", "アカウントID", "ID", "メール"]:
         try:
@@ -280,7 +245,7 @@ def password_login(page) -> bool:
             except Exception:
                 pass
 
-    # 填密码
+    # Fill password
     filled_pwd = False
     for label in ["パスワード", "Password"]:
         try:
@@ -302,7 +267,7 @@ def password_login(page) -> bool:
             except Exception:
                 pass
 
-    # 提交
+    # Submit
     clicked = click_by_text(page, ["ログイン", "ログインする", "サインイン", "ログオン", "ログインへ"])
     if not clicked and filled_pwd:
         try:
@@ -317,151 +282,61 @@ def password_login(page) -> bool:
     snap(page, "after_login_submit")
     return is_logged_in(page)
 
-# ------------------ Navigation ------------------
-UPGRADE_TEXTS = [
-    "アップグレード・期限延長", "アップグレード/期限延長", "アップグレード ・ 期限延長",
-    "期限延長", "期限を延長する", "更新", "更新手続き",
-    "プラン変更・期限延長", "プラン変更"
-]
-DETAIL_TEXTS = ["詳細", "管理", "設定", "ゲーム詳細", "サービス詳細", "契約情報", "メニュー"]
-CONTRACT_TEXTS = ["契約", "契約情報", "料金", "お支払い", "支払い", "請求", "更新", "延長", "プラン変更"]
-
-def ensure_on_game_index(page):
-    goto(page, GAME_INDEX_URL)
-    snap(page, "on_game_index")
-
-def open_game_management(page) -> bool:
-    # 按行点击右侧“ゲーム管理”按钮（表格里的蓝色按钮）
-    def click_row_btn(row) -> bool:
-        for sel in [
-            'button:has-text("ゲーム管理")',
-            '[role="button"]:has-text("ゲーム管理")',
-            'a:has-text("ゲーム管理")',
-            ':is(button,a,div,span)[class*="btn"]:has-text("ゲーム管理")',
-            ':is(button,a,div,span):has-text("ゲーム管理")',
-        ]:
-            try:
-                loc = row.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible():
-                    return try_click(page, loc.first, timeout=1500)
-            except Exception:
-                pass
-        return False
-
-    # 先用 TARGET_GAME 锁定行（例如“waters”）
-    target_row = None
-    if TARGET_GAME:
-        try:
-            tbody_rows = page.locator("tbody tr").filter(has_text=TARGET_GAME)
-            if tbody_rows.count() > 0:
-                target_row = tbody_rows.first
-            else:
-                any_rows = page.locator("tr").filter(has_text=TARGET_GAME)
-                if any_rows.count() > 0:
-                    target_row = any_rows.first
-        except Exception:
-            target_row = None
-
-    if target_row:
-        if click_row_btn(target_row):
-            snap(page, "clicked_row_game_management_target")
-            try:
-                page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-            except Exception:
-                pass
-            return True
-
-    # 没指定或没命中：点第一个“ゲーム管理”
-    for sel in [
-        'tbody tr:has(button:has-text("ゲーム管理")) >> button:has-text("ゲーム管理")',
-        'tbody tr:has([role="button"]:has-text("ゲーム管理")) >> [role="button"]:has-text("ゲーム管理")',
-        'tbody tr:has(a:has-text("ゲーム管理")) >> a:has-text("ゲーム管理")',
-        'button:has-text("ゲーム管理")',
-        '[role="button"]:has-text("ゲーム管理")',
-        'a:has-text("ゲーム管理")',
-    ]:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                if try_click(page, loc.first, timeout=1500):
-                    snap(page, "clicked_row_game_management_first")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-                    except Exception:
-                        pass
-                    return True
-        except Exception:
-            pass
-
-    # 遍历前几行兜底
+# ------------------ Navigation & Action ------------------
+def navigate_to_game_management(page) -> bool:
+    # サービス管理
+    if not click_by_text(page, ["サービス管理", "サービス", "管理"]):
+        log("Could not find サービス管理, going directly to game index.")
+        goto(page, GAME_INDEX_URL)
     try:
-        rows = page.locator("tbody tr")
-        cnt = rows.count()
-        n = min(cnt if cnt else 0, 10)
-        for i in range(n):
-            row = rows.nth(i)
-            if click_row_btn(row):
-                snap(page, f"clicked_row_game_management_index_{i}")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-                except Exception:
-                    pass
-                return True
+        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
+    snap(page, "after_service_mgmt")
 
-    snap(page, "game_management_not_found")
-    log("Row-level 'ゲーム管理' button was not found.")
-    return False
-
-def open_game_detail(page) -> bool:
-    # 如需从“詳細/管理/設定”进入（备用路径）
+    # XServerGAMEs
+    click_by_text(page, ["XServerGAMEs", "XServerGAMES", "XServerGAME", "Xserverゲーム", "XserverGAMEs", "XSERVER GAME", "GAMEs"])
     try:
-        if TARGET_GAME:
-            container = page.locator(f'text={TARGET_GAME}').first
-            if container and container.count() > 0:
-                parent = container.locator('xpath=ancestor::*[self::tr or contains(@class,"card") or contains(@class,"item")][1]')
-                for t in DETAIL_TEXTS:
-                    if try_click(page, parent.locator(f'text={t}')) or try_click(page, container.locator(f'text={t}')):
-                        return True
-        if click_text_global(page, DETAIL_TEXTS):
-            return True
+        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
     except Exception:
         pass
-    return False
+    snap(page, "after_xservergames")
+
+    # ゲーム管理
+    click_by_text(page, ["ゲーム管理", "ゲーム", "管理"])
+    try:
+        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
+    except Exception:
+        pass
+    snap(page, "after_game_management")
+    return True
 
 def click_upgrade_or_extend(page) -> bool:
-    # 在“ゲーム管理”页直接找入口
-    if click_text_global(page, UPGRADE_TEXTS):
-        snap(page, "after_click_upgrade_extend")
-        return True
-
-    # 兜底：进入“詳細/管理/設定”或“契約/料金/更新”再找
-    log("Upgrade/extend not found on game-management page. Trying detail/billing...")
-    if open_game_detail(page):
+    if TARGET_GAME:
+        log(f"Trying to select target game: {TARGET_GAME}")
         try:
-            page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
+            container = page.locator(f'text={TARGET_GAME}').first
+            if container.count() > 0:
+                for up_text in ["アップグレード・期限延長", "期限延長", "アップグレード"]:
+                    # Try within nearest row/card
+                    try:
+                        parent = container.locator('xpath=ancestor::*[self::tr or self::*[@role="row"] or contains(@class,"card")][1]')
+                        if try_click(page, parent.locator(f'text={up_text}')):
+                            return True
+                    except Exception:
+                        pass
+                    if try_click(page, container.locator(f'text={up_text}')):
+                        return True
         except Exception:
             pass
-        snap(page, "after_open_detail")
-        if click_text_global(page, UPGRADE_TEXTS):
-            snap(page, "after_click_upgrade_extend_from_detail")
-            return True
-        if click_text_global(page, ["契約", "契約情報", "料金", "お支払い", "支払い", "請求", "更新", "延長", "プラン変更"]):
-            try:
-                page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-            except Exception:
-                pass
-            snap(page, "after_open_contract_or_billing")
-            if click_text_global(page, UPGRADE_TEXTS):
-                snap(page, "after_click_upgrade_extend_from_contract")
-                return True
 
-    snap(page, "open_upgrade_extend_failed")
-    dump_html(page, "open_upgrade_extend_failed")
-    return False
+    ok = click_by_text(page, ["アップグレード・期限延長", "期限延長", "アップグレード"])
+    if ok:
+        snap(page, "after_click_upgrade_extend")
+    else:
+        log("Could not find アップグレード・期限延長 on current page.")
+    return ok
 
-# ------------------ Extend ------------------
 def select_hours(page, hours: int) -> bool:
     hours_str = str(hours)
     texts = [
@@ -499,19 +374,11 @@ def select_hours(page, hours: int) -> bool:
                 return True
         except Exception:
             pass
-    return click_text_global(page, texts)
+    return click_by_text(page, texts)
 
 def do_extend_hours(page, hours: int) -> bool:
-    # 你的最新流程：先在“アップグレード・期限延長”页底部点击“期限を延長する”，再选择时长
-    scroll_to_bottom(page)
-    if not click_text_global(page, ["期限を延長する", "延長する"]):
-        log("Entry button '期限を延長する' not found at bottom; trying anyway.")
-    else:
-        try:
-            page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
-        except Exception:
-            pass
-        snap(page, "after_click_entry_extend")
+    # 入口按钮
+    click_by_text(page, ["期限を延長する", "延長する"])
 
     if not select_hours(page, hours):
         log(f"Could not select +{hours}時間 option. It may be unavailable or UI changed.")
@@ -519,16 +386,8 @@ def do_extend_hours(page, hours: int) -> bool:
     else:
         snap(page, f"selected_{hours}h")
 
-    accept_required_checks(page)
-
-    # 確認画面に進む
-    confirm_texts = [
-        "確認画面に進む", "確認へ進む", "確認画面へ", "確認画面へ進む",
-        "申込内容を確認", "申し込み内容を確認", "申込み内容を確認",
-        "確認する", "次へ", "次に進む", "進む"
-    ]
-    if not click_text_global(page, confirm_texts):
-        log("Could not find a confirm-step button; maybe already on confirm page.")
+    if not click_by_text(page, ["確認画面に進む", "確認へ進む", "確認"]):
+        log("Could not find 確認画面に進む (maybe already on confirm).")
     else:
         try:
             page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
@@ -536,21 +395,10 @@ def do_extend_hours(page, hours: int) -> bool:
             pass
         snap(page, "after_go_confirm")
 
-    scroll_to_bottom(page)
-    accept_required_checks(page)
-
-    # 最终提交
-    final_texts = [
-        "期限を延長する", "延長する", "実行する",
-        "延長を確定する", "確定する",
-        "申込みを確定する", "お申し込みを確定する",
-        "申込を確定する", "お申込みを確定する"
-    ]
-    if not click_text_global(page, final_texts):
-        if not click_submit_fallback(page):
-            log("Could not find the final submit button.")
-            snap(page, "failed_final_extend_click")
-            return False
+    if not click_by_text(page, ["期限を延長する", "延長する", "実行する"]):
+        log("Could not find the final 期限を延長する button.")
+        snap(page, "failed_final_extend_click")
+        return False
 
     try:
         page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
@@ -558,7 +406,7 @@ def do_extend_hours(page, hours: int) -> bool:
         pass
     snap(page, "after_extend_submit")
 
-    for t in ["延長", "完了", "処理が完了", "更新されました", "受け付けました", "受付しました", "手続きが完了"]:
+    for t in ["延長", "完了", "処理が完了", "更新されました", "受け付けました"]:
         try:
             if page.get_by_text(t, exact=False).first.is_visible():
                 log("Extension likely succeeded.")
@@ -570,6 +418,18 @@ def do_extend_hours(page, hours: int) -> bool:
 
 # ------------------ Main ------------------
 def main():
+    # Interval gate (skip if not due)
+    if not FORCE_RENEW:
+        ok, due = should_run_interval(RENEW_LOG_MD, RENEW_INTERVAL_HOURS)
+        if not ok:
+            last = get_last_success_utc(RENEW_LOG_MD)
+            log(f"Not due yet. Last success (UTC): {last.isoformat() if last else 'N/A'}, Next due (UTC): {due.isoformat() if due else 'N/A'}")
+            sys.exit(0)
+        else:
+            log("Interval due or first run. Proceeding...")
+    else:
+        log("FORCE_RENEW=1, skipping interval check.")
+
     if not COOKIE_STR and (not EMAIL or not PASSWORD):
         log("No cookie provided and missing EMAIL/PASSWORD. Please set GitHub Secrets.")
         sys.exit(1)
@@ -586,7 +446,6 @@ def main():
         page = context.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT)
 
-        # 登录：先 Cookie，后账号密码
         logged_in = False
         if COOKIE_STR:
             log("Trying cookie login...")
@@ -602,27 +461,17 @@ def main():
             browser.close()
             sys.exit(2)
 
-        # 登录后直接到 xmgame/index
-        ensure_on_game_index(page)
+        log("Navigating to Game Management...")
+        navigate_to_game_management(page)
 
-        # ゲーム管理（表格行内按钮）
-        log("Opening ゲーム管理 (row button)...")
-        if not open_game_management(page):
-            log("Could not open ゲーム管理 (row). Exiting.")
-            dump_html(page, "game_management_not_found")
-            context.close()
-            browser.close()
-            sys.exit(3)
-
-        # アップグレード・期限延長
-        log("Opening アップグレード・期限延長...")
+        log("Opening upgrade/extend page...")
         if not click_upgrade_or_extend(page):
             log("Could not open upgrade/extend page. Exiting.")
+            snap(page, "open_upgrade_extend_failed")
             context.close()
             browser.close()
             sys.exit(3)
 
-        # 执行续期
         log(f"Performing +{RENEW_HOURS}h extension...")
         success = do_extend_hours(page, RENEW_HOURS)
 
