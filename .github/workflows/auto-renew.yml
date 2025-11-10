@@ -2,15 +2,11 @@ name: XServerGAMEs Auto Renew
 
 on:
   schedule:
-    - cron: "0 */12 * * *"     # 每12小时触发一次，由脚本内限流控制每≥60小时才真正续期
-  workflow_dispatch:            # 手动触发，允许手动续期
+    - cron: "0 0 */2 * *"   # 每两天（UTC）执行一次
+  workflow_dispatch:         # 允许手动触发（不带 force）
     inputs:
-      force:
-        description: "Force run (1 to ignore 60h gate)"
-        required: false
-        default: "0"
       renew_hours:
-        description: "Renew hours to select on page (e.g., 72, 60)"
+        description: "Renew hours to select on page (e.g., 72)"
         required: false
         default: "72"
       target_game:
@@ -23,7 +19,7 @@ on:
         default: "Asia/Tokyo"
 
 permissions:
-  contents: write   # 允许提交 renew_result.md
+  contents: write
 
 jobs:
   renew:
@@ -46,18 +42,19 @@ jobs:
           pip install playwright
           python -m playwright install --with-deps chromium
 
+      - name: Syntax check
+        run: python -m py_compile xserver_autorenew.py
+
       - name: Run auto renew
         env:
-          # 登录信息（至少提供 Cookie，或提供邮箱+密码作为兜底）
+          # 登录信息
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_COOKIE: ${{ secrets.XSERVER_COOKIE }}
 
           # 业务参数
           TARGET_GAME: ${{ github.event.inputs.target_game || secrets.TARGET_GAME }}
-          RENEW_HOURS: ${{ github.event.inputs.renew_hours || '72' }}   # 页面选择的续期时长
-          RENEW_INTERVAL_HOURS: "60"                                    # 续期间隔（脚本限流）
-          FORCE_RENEW: ${{ github.event.inputs.force || '0' }}          # 1=无视60h限流，手动立即续期
+          RENEW_HOURS: ${{ github.event.inputs.renew_hours || '72' }}
           LOG_TIMEZONE: ${{ github.event.inputs.timezone || 'Asia/Tokyo' }}
           RENEW_LOG_MD: ${{ env.RENEW_LOG_MD }}
 
@@ -70,6 +67,7 @@ jobs:
       - name: Commit renewal log (if updated)
         if: always()
         run: |
+          set -e
           FILE="${{ env.RENEW_LOG_MD }}"
           if [ -f "$FILE" ]; then
             git config user.name "github-actions[bot]"
@@ -83,6 +81,7 @@ jobs:
             fi
           else
             echo "No log file to commit."
+          fi
 
       - name: Upload screenshots (always)
         if: always()
@@ -90,4 +89,12 @@ jobs:
         with:
           name: screenshots
           path: screenshots
+          if-no-files-found: ignore
+
+      - name: Upload page HTML (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pages
+          path: pages
           if-no-files-found: ignore
