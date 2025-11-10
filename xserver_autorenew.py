@@ -542,4 +542,101 @@ def do_extend_hours(page, hours: int) -> bool:
     # 最终提交
     final_texts = [
         "期限を延長する", "延長する", "実行する",
-        "延長を確定する", 
+        "延長を確定する", "確定する",
+        "申込みを確定する", "お申し込みを確定する",
+        "申込を確定する", "お申込みを確定する"
+    ]
+    if not click_text_global(page, final_texts):
+        if not click_submit_fallback(page):
+            log("Could not find the final submit button.")
+            snap(page, "failed_final_extend_click")
+            return False
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=DEFAULT_TIMEOUT)
+    except Exception:
+        pass
+    snap(page, "after_extend_submit")
+
+    for t in ["延長", "完了", "処理が完了", "更新されました", "受け付けました", "受付しました", "手続きが完了"]:
+        try:
+            if page.get_by_text(t, exact=False).first.is_visible():
+                log("Extension likely succeeded.")
+                return True
+        except Exception:
+            pass
+    log("Did not detect a success message; treating as success but please review screenshots.")
+    return True
+
+# ------------------ Main ------------------
+def main():
+    if not COOKIE_STR and (not EMAIL or not PASSWORD):
+        log("No cookie provided and missing EMAIL/PASSWORD. Please set GitHub Secrets.")
+        sys.exit(1)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        page.set_default_timeout(DEFAULT_TIMEOUT)
+
+        # 登录：先 Cookie，后账号密码
+        logged_in = False
+        if COOKIE_STR:
+            log("Trying cookie login...")
+            logged_in = cookie_login(context, page)
+        if not logged_in and EMAIL and PASSWORD:
+            log("Trying password login...")
+            logged_in = password_login(page)
+
+        if not logged_in:
+            snap(page, "login_failed")
+            log("Login failed. Check credentials/cookie.")
+            context.close()
+            browser.close()
+            sys.exit(2)
+
+        # 登录后直接到 xmgame/index
+        ensure_on_game_index(page)
+
+        # ゲーム管理（表格行内按钮）
+        log("Opening ゲーム管理 (row button)...")
+        if not open_game_management(page):
+            log("Could not open ゲーム管理 (row). Exiting.")
+            dump_html(page, "game_management_not_found")
+            context.close()
+            browser.close()
+            sys.exit(3)
+
+        # アップグレード・期限延長
+        log("Opening アップグレード・期限延長...")
+        if not click_upgrade_or_extend(page):
+            log("Could not open upgrade/extend page. Exiting.")
+            context.close()
+            browser.close()
+            sys.exit(3)
+
+        # 执行续期
+        log(f"Performing +{RENEW_HOURS}h extension...")
+        success = do_extend_hours(page, RENEW_HOURS)
+
+        if success:
+            write_success_md(RENEW_LOG_MD, LOG_TIMEZONE)
+            log("All steps completed.")
+            rc = 0
+        else:
+            log("Extension step reported failure.")
+            rc = 4
+
+        context.close()
+        browser.close()
+        sys.exit(rc)
+
+if __name__ == "__main__":
+    main()
